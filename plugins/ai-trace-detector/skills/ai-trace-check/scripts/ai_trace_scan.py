@@ -4,6 +4,7 @@
 ai_trace_scan.py - 文档 AI 生成痕迹扫描器（只读，不修改文件）
 
 支持: .docx .pptx .xlsx .pdf（以及 .txt/.md/.html 的正文痕迹检查）
+一次传入多个文件时，会自动比对它们是否同源、批注是否被改过时间。
 只依赖 Python 标准库；装有 pypdf 时 PDF 检查更完整（批注、正文）。
 
 用法:
@@ -11,28 +12,37 @@ ai_trace_scan.py - 文档 AI 生成痕迹扫描器（只读，不修改文件）
       [--mode review|self|both] [--format md|json] [--out 报告路径]
       [--expect-author 姓名] [--expect-org 机构]
 
-检查 8 类: 作者 / 路径 / 时间 / 批注与修订 / 文件结构 / 正文残留 / 官方标识 / 嵌入对象
+检查 9 类: 作者 / 路径 / 时间 / 批注与修订 / 文件结构 / 正文残留 / 官方标识 / 嵌入对象 / 文件外痕迹
+（文件外痕迹指下载来源、隔离标记、文件系统时间，只有在文件原本所在的电脑上运行才查得到）
 证据分级: strong(直接痕迹) / medium(间接疑点) / weak(弱提示) / info(仅供参考)
 注意: 本工具判断的是"文件是否由程序或 AI 工具生成、粘贴、加工"，
       不能判断文字是不是人想出来的；任何一条都不是定论。
 """
 import argparse
 import datetime as dt
+import hashlib
 import html
 import io
+import itertools
 import json
+import logging
 import os
+import plistlib
 import re
+import statistics
+import subprocess
 import sys
 import zipfile
 
-VERSION = "0.1.0"
+logging.getLogger("pypdf").setLevel(logging.ERROR)
+
+VERSION = "0.2.0"
 UTC = dt.timezone.utc
 TOL = dt.timedelta(hours=14)  # 时区误差容忍：很多程序把本地时间当 UTC 写入
 
 CATS = {
     "author": "作者", "path": "路径", "time": "时间", "review": "批注与修订",
-    "struct": "文件结构", "text": "正文残留", "label": "官方标识", "embed": "嵌入对象",
+    "struct": "文件结构", "text": "正文残留", "label": "官方标识", "embed": "嵌入对象", "fs": "文件外痕迹",
 }
 LEVELS = ["strong", "medium", "weak", "info"]
 LEVEL_ZH = {"strong": "强", "medium": "中", "weak": "弱", "info": "参考"}
@@ -109,6 +119,21 @@ TMP_PATH = re.compile(r"(?<![\w.:/])/tmp/[\w\-./]{3,}")
 USER_PATH = re.compile(
     r"([A-Za-z]:\\(?:Users|Documents and Settings)\\([^\\\"<>|\r\n]+)\\[^\"<>|\r\n]*)|"
     r"(/Users/([^/\"<>\s]+)/[^\"<>\s]*)|(/home/([^/\"<>\s]+)/[^\"<>\s]*)")
+PDF_HEADERS = [
+    (b"\xc4\xe5\xf2\xe5\xeb\xa7\xf3\xa0\xd0\xc4\xc6", "macOS Quartz"),
+    (b"\xb5\xb5\xb5\xb5", "Microsoft Office"),
+    (b"\x93\x8c\x8b\x9e", "ReportLab"),
+    (b"\xbf\xf7\xa2\xfe", "qpdf"),
+    (b"\xd0\xd4\xc5\xd8", "pdfTeX"),
+    (b"\xc7\xec\x8f\xa2", "Ghostscript"),
+    (b"\xe2\xe3\xcf\xd3", "Acrobat / iText / pypdf 等通用写法"),
+]
+AI_DOMAINS = re.compile(
+    r"chatgpt\.com|chat\.openai\.com|oaiusercontent\.com|openai\.com|claude\.ai|claudeusercontent\.com|anthropic\.com|"
+    r"gemini\.google\.com|aistudio\.google\.com|notebooklm\.google|copilot\.microsoft\.com|perplexity\.ai|doubao\.com|"
+    r"deepseek\.com|kimi\.(?:com|ai)|moonshot\.cn|yiyan\.baidu\.com|tongyi\.(?:aliyun\.com|com)|chatglm\.cn|grok\.com|"
+    r"poe\.com|manus\.im|gamma\.app|genspark\.ai", re.I)
+AI_AGENTS = re.compile(r"chatgpt|claude|copilot|gemini|perplexity|doubao|豆包|deepseek|kimi|codex|cursor|comet|atlas", re.I)
 C2PA_AI = re.compile(rb"trainedAlgorithmicMedia|compositeWithTrainedAlgorithmicMedia|OpenAI|ChatGPT|DALL|Anthropic|Claude|"
                      rb"Midjourney|Firefly|Stability|Google AI|Gemini|Imagen|Copilot|Designer|Bing Image", re.I)
 
@@ -194,6 +219,7 @@ class Report:
         self.facts = {}        # 展示用的基本属性
         self.exposure = []     # 自查：对外会暴露的信息
         self.notes = []        # 未能检查的内容
+        self.fp = {}           # 指纹：用于多文件比对和文件外痕迹比对
         self._seen = set()
 
     def add(self, cat, level, title, evidence="", innocent="", where=""):
@@ -219,7 +245,7 @@ class Report:
     def verdict(self):
         c = self.counts()
         if c["strong"]:
-            return "A", "发现直接痕迹：文件由程序或 AI 工具生成，或含有从 AI 对话带出的内容"
+            return "A", "发现直接痕迹：文件由程序或 AI 工具生成或改写，或含有从 AI 对话带出的内容"
         if c["medium"] >= 3:
             return "B", "多项间接疑点叠加，建议向提交人核实原始文件和写作过程"
         if c["medium"]:
@@ -290,7 +316,14 @@ def check_core_times(R, created, modified, raw_created, raw_modified, where):
             R.add("time", "weak", f"{label}时间恰好是零点整", raw, "程序只写了日期没写时间；人工保存很少恰好落在零点整", where)
 
 
-def check_events(R, events, label, created, modified, where, minute_precision_expected=False, mass_ok=False):
+def _far(a, b):
+    """两处批注的位置是否相距很远（不同页，或同页纵向相差超过约 3 行）。"""
+    if a is None or b is None:
+        return True
+    return a[0] != b[0] or abs(a[1] - b[1]) > 40
+
+
+def check_events(R, events, label, created, modified, where, minute_precision_expected=False, mass_ok=False, positions=None):
     """events: [(作者, datetime 或 None, 原始时间字符串)]"""
     if not events:
         return
@@ -323,11 +356,23 @@ def check_events(R, events, label, created, modified, where, minute_precision_ex
                   "Word 的「比较文档」功能会这样；否则说明修订是程序一次性生成的", where)
         subsec = any(d.second != 0 for d in times)
         if subsec and times[0] != times[-1]:
-            gaps = [(b - a).total_seconds() for a, b in zip(times, times[1:])]
-            fast = sum(1 for g in gaps if g < 3)
-            if fast >= 3 and fast >= len(gaps) * 0.6:
-                R.add("review", "medium", f"{label}之间的间隔短得不像人工操作", f"{len(dated)} 条中有 {fast} 个间隔不到 3 秒",
-                      "批量粘贴或宏操作；否则是程序连续写入", where)
+            pts = sorted(((e[1], positions[i] if positions else None) for i, e in enumerate(events) if e[1]), key=lambda x: x[0])
+            clusters = clustered = 0
+            i = 0
+            while i < len(pts):
+                j = i
+                while j + 1 < len(pts) and (pts[j + 1][0] - pts[j][0]).total_seconds() <= 1:
+                    j += 1
+                if j > i and any(_far(pts[k][1], pts[k + 1][1]) for k in range(i, j)):
+                    clusters += 1
+                    clustered += j - i + 1
+                i = j + 1
+            span = int((times[-1] - times[0]).total_seconds())
+            if clusters >= 3 and clustered >= len(pts) * 0.4:
+                R.add("review", "medium", f"多处{label}在同一秒内成批出现，不像人工逐条操作",
+                      f"{len(pts)} 条中有 {clustered} 条分成 {clusters} 批，每批落在同一两秒内"
+                      + ("，同批之间位置相距很远" if positions else "") + f"；全部{label}的时间跨度 {span} 秒",
+                      "脚本、宏或自动化工具批量标注；人手逐条点选做不到同一秒标出相隔很远的几处", where)
         if all(d.minute == 0 and d.second == 0 for d in times) and len(set(times)) >= 2:
             R.add("review", "medium", f"{label}的时间全是整点", "、".join(fmt(t) for t in times[:4]),
                   "人工审阅很难每条都落在整点，像是编造的时间", where)
@@ -452,6 +497,12 @@ def scan_ooxml(path, kind, R, opts, depth=0):
     company, template, manager = tag(app, "Company"), tag(app, "Template"), tag(app, "Manager")
     total_time, app_words = tag(app, "TotalTime"), tag(app, "Words")
 
+    R.fp.update(created=created, modified=modified)
+    try:
+        with open(path, "rb") as fh:
+            R.fp["sha"] = hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        pass
     F = R.facts
     F["作者"] = creator or "（空）"
     F["最后保存者"] = last_by or "（空）"
@@ -683,6 +734,12 @@ def docx_specific(z, names, R, body_xml, words, created, modified, creator, last
         a = re.search(r'w:author="([^"]*)"', m.group(1))
         d = re.search(r'w:date="([^"]*)"', m.group(1))
         ev.append((html.unescape(a.group(1)) if a else "", parse_iso(d.group(1)) if d else None, d.group(1) if d else ""))
+    if len(ev) >= 2:
+        bodies = [hashlib.md5(xml_text(b).strip().encode("utf-8")).hexdigest()[:10]
+                  for b in re.findall(r"<w:comment\b[^>]*>(.*?)</w:comment>", comments, re.S)]
+        if len(bodies) == len(ev):
+            R.fp["geom"] = tuple(sorted((0, "comment", (), ev[i][0] + ":" + bodies[i]) for i in range(len(ev))))
+            R.fp["times"] = tuple(sorted(r for _, _, r in ev))
     if ev:
         authors = sorted({a for a, _, _ in ev if a})
         R.facts["批注"] = f"{len(ev)} 条，署名：{'、'.join(authors) or '无'}"
@@ -857,7 +914,9 @@ def scan_pdf(path, R, opts):
     R.kind = "PDF"
     data = open(path, "rb").read()
     info, xmp_raw, annots, text = {}, "", [], ""
+    apos, ageom, id_pair = [], [], None
     used_pypdf = False
+    R.fp["sha"] = hashlib.sha256(data).hexdigest()
     try:
         import pypdf  # type: ignore
         rd = pypdf.PdfReader(io.BytesIO(data))
@@ -871,6 +930,16 @@ def scan_pdf(path, R, opts):
             info[str(k).lstrip("/")] = str(v)
         used_pypdf = True
         R.facts["页数"] = len(rd.pages)
+        try:
+            ids = rd.trailer.get("/ID")
+            if ids and len(ids) >= 2:
+                def _hx(v):
+                    v = v.get_object() if hasattr(v, "get_object") else v
+                    b = v.original_bytes if hasattr(v, "original_bytes") else (v if isinstance(v, bytes) else str(v).encode("latin1"))
+                    return b.hex()
+                id_pair = (_hx(ids[0]), _hx(ids[1]))
+        except Exception:
+            pass
         chunks = []
         for i, page in enumerate(rd.pages):
             if i < 150:
@@ -892,8 +961,15 @@ def scan_pdf(path, R, opts):
                     annots.append((str(a.get("/T", "")), parse_pdf_date(str(a.get("/M", "") or a.get("/CreationDate", ""))),
                                    str(a.get("/M", "") or a.get("/CreationDate", ""))))
                     c = a.get("/Contents")
+                    try:
+                        rect = [round(float(x), 1) for x in a.get("/Rect", [])]
+                    except Exception:
+                        rect = []
+                    apos.append((i, rect[1]) if len(rect) == 4 else None)
+                    ageom.append((i, st, tuple(rect), str(c or "")))
                     if c:
                         chunks.append(str(c))
+                        R.expose("批注或文本框里填写的内容", str(c), f"第 {i + 1} 页")
             except Exception:
                 pass
         text = "\n".join(chunks)
@@ -960,6 +1036,39 @@ def scan_pdf(path, R, opts):
         F["增量保存次数"] = eofs - 1
         R.add("struct", "info", f"PDF 在生成后被追加保存过 {eofs - 1} 次", "", "加批注、签名、填表都会追加；被改动的旧内容可能仍留在文件里", "文件结构")
         R.expose("增量保存的历史版本", f"{eofs - 1} 次追加，旧内容可能可恢复", "文件结构")
+    # ---- 文件头、日期写法是否与声称的生成器一致
+    hm = re.match(rb"%PDF-\d\.\d\s*%([\x80-\xff][^\r\n]{2,14})", data[:48])
+    hdr_name = ""
+    if hm:
+        for sig, nm in PDF_HEADERS:
+            if hm.group(1).startswith(sig):
+                hdr_name = nm
+                break
+        F["文件头写法"] = hdr_name or "未识别（" + hm.group(1)[:6].hex() + "）"
+    is_quartz = bool(re.search(r"quartz pdfcontext", producer, re.I))
+    if is_quartz and hm and hdr_name != "macOS Quartz":
+        R.add("struct", "medium", "生成器栏写着 macOS，但文件头不是 macOS 的写法",
+              f"文件头属于：{hdr_name or '未识别的程序'}；说明文件被别的程序整体重写过，只是保留了原来的生成器名称",
+              "用 PDF 工具做过合并、压缩、解密；改写元数据的脚本也会留下这个特征", "文件头")
+    if hdr_name == "ReportLab" and not re.search(r"reportlab", producer, re.I):
+        R.add("struct", "medium", "文件头是 ReportLab 的写法，生成器栏却写着别的程序", f"Producer = {producer or '空'}",
+              "生成器名称被改过，或文件被二次处理", "文件头")
+    raw_dates = [v for k, v in info.items() if k in ("CreationDate", "ModDate") and v] + [r for _, _, r in annots if r]
+    if is_quartz and raw_dates:
+        odd = [d for d in raw_dates if not re.search(r"Z(00'00'?)?$", d.strip())]
+        if odd:
+            R.add("time", "medium", "日期的写法与声称的生成器不符", f"{len(raw_dates)} 个日期中有 {len(odd)} 个不是 macOS 的 UTC 写法，例：{odd[0]}",
+                  "macOS 写日期用 Z00'00' 结尾的 UTC 格式；带时区偏移的写法说明这些日期是别的程序写入的", "PDF Info / 批注")
+    if ic and im and ic.second == 0 and im.second == 0 and ic != im and any(d and d.second for _, d, _ in annots):
+        R.add("time", "weak", "创建和修改时间都恰好落在整分钟", f"{info.get('CreationDate')}；{info.get('ModDate')}",
+              "两个时间同时秒数为 0 的概率很低，像是手工或脚本填写的", "PDF Info")
+    if id_pair:
+        F["文件标识(ID)"] = f"{id_pair[0][:12]}… / {id_pair[1][:12]}…"
+        R.fp.update(id0=id_pair[0].lower(), id1=id_pair[1].lower())
+    R.fp.update(created=created, modified=modified)
+    if ageom:
+        R.fp["geom"] = tuple(sorted(ageom))
+        R.fp["times"] = tuple(sorted(r for _, _, r in annots))
     raw_txt = data.decode("latin1")
     scan_paths(R, raw_txt[:20_000_000], "PDF 原始数据")
     scan_binary_labels(R, data, "PDF 原始数据", is_image=True)
@@ -974,7 +1083,11 @@ def scan_pdf(path, R, opts):
         F["批注"] = f"{len(annots)} 条，署名：{'、'.join(an) or '无'}"
         for a in an:
             R.expose("批注人", a, "PDF 批注")
-        check_events(R, annots, "批注", created, modified, "PDF 批注")
+        ds = sorted(d for _, d, _ in annots if d)
+        if len(ds) >= 2:
+            gaps = [(b - a).total_seconds() for a, b in zip(ds, ds[1:])]
+            F["批注时间线"] = f"{fmt(ds[0])} ~ {fmt(ds[-1])}，跨度 {int((ds[-1] - ds[0]).total_seconds())} 秒，间隔中位数 {int(statistics.median(gaps))} 秒"
+        check_events(R, annots, "批注", created, modified, "PDF 批注", positions=apos if len(apos) == len(annots) else None)
     if not used_pypdf and b"/ObjStm" in data and not info:
         R.notes.append("PDF 属性存放在压缩对象流里，基础检查读不到（安装 pypdf 可解决）")
 
@@ -993,6 +1106,145 @@ def scan_plain(path, R, opts):
     scan_paths(R, text, "正文")
     scan_binary_labels(R, data, "文件内容")
     R.notes.append("纯文本文件没有内嵌元数据，只做了正文残留检查")
+
+
+# ---------------------------------------------------------------- 文件外痕迹（下载来源、隔离标记、文件系统时间）
+def _xattr(path, name):
+    try:
+        if hasattr(os, "getxattr"):
+            return os.getxattr(path, name)
+    except OSError:
+        pass
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["xattr", "-px", name, path], capture_output=True, timeout=10)
+            if out.returncode == 0:
+                return bytes.fromhex(re.sub(rb"[^0-9A-Fa-f]", b"", out.stdout).decode())
+        except Exception:
+            pass
+    return None
+
+
+def parse_wherefroms(raw):
+    try:
+        v = plistlib.loads(raw)
+        return [str(x) for x in (v if isinstance(v, list) else [v]) if x]
+    except Exception:
+        return [u.decode("latin1") for u in re.findall(rb"https?://[\x21-\x7e]+", raw or b"")]
+
+
+def parse_quarantine(raw):
+    """com.apple.quarantine 的格式: 标志;十六进制时间戳;程序名;UUID"""
+    parts = (raw or b"").decode("utf-8", "replace").strip().split(";")
+    when = None
+    if len(parts) >= 2:
+        try:
+            when = dt.datetime.fromtimestamp(int(parts[1], 16), UTC)
+        except Exception:
+            pass
+    return (parts[2] if len(parts) >= 3 else ""), when
+
+
+def scan_fs(path, R):
+    urls, agent, qtime, found = [], "", None, False
+    raw = _xattr(path, "com.apple.metadata:kMDItemWhereFroms")
+    if raw:
+        urls += parse_wherefroms(raw)
+        found = True
+    raw = _xattr(path, "com.apple.quarantine")
+    if raw:
+        agent, qtime = parse_quarantine(raw)
+        found = True
+    for nm in ("user.xdg.origin.url", "user.xdg.referrer.url"):
+        raw = _xattr(path, nm)
+        if raw:
+            urls.append(raw.decode("utf-8", "replace"))
+            found = True
+    if os.name == "nt":
+        try:
+            with open(path + ":Zone.Identifier", "r", encoding="utf-8", errors="replace") as fh:
+                z = fh.read()
+            urls += re.findall(r"(?m)^(?:HostUrl|ReferrerUrl)=(.+)$", z)
+            found = True
+        except OSError:
+            pass
+    urls = [u.strip() for u in urls if u and u.strip()]
+    native = sys.platform == "darwin" or os.name == "nt"
+    if not found and not native:
+        R.notes.append("文件外痕迹（下载来源、隔离标记、文件系统时间）未检查：这些记录只保存在文件原本所在的电脑上，"
+                       "上传或通过聊天发送后就没有了。要查这一类，请在那台电脑上直接运行本脚本")
+        return
+    if urls:
+        R.facts["下载来源"] = "；".join(clip(u, 120) for u in urls[:4])
+        for u in urls:
+            R.expose("下载来源网址", u, "文件扩展属性")
+        ai = [u for u in urls if AI_DOMAINS.search(u)]
+        if ai:
+            R.add("fs", "strong", "电脑记录显示这个文件是从 AI 产品的网站下载的", ai[0],
+                  "说明文件本身出自该产品的下载链接；内容是否经过人工修改需另外核实", "文件扩展属性")
+        else:
+            R.add("fs", "info", "电脑记录了这个文件的下载来源", clip(urls[0], 200), "可与提交人说的文件来历对照", "文件扩展属性")
+    if agent:
+        R.facts["下载或创建它的程序"] = agent + (f"（{fmt(qtime)}）" if qtime else "")
+        R.expose("下载或创建它的程序", agent, "隔离标记")
+        if AI_AGENTS.search(agent):
+            R.add("fs", "strong", f"电脑记录显示这个文件是由「{agent}」放到本机的", fmt(qtime) if qtime else "",
+                  "说明文件经过了这个 AI 客户端", "隔离标记")
+    try:
+        st = os.stat(path)
+    except OSError:
+        return
+    mtime = dt.datetime.fromtimestamp(st.st_mtime, UTC)
+    birth = getattr(st, "st_birthtime", None) or (st.st_ctime if os.name == "nt" else None)
+    birth = dt.datetime.fromtimestamp(birth, UTC) if birth else None
+    R.facts["电脑记录的最后写入时间"] = fmt(mtime)
+    if birth:
+        R.facts["电脑记录的创建时间"] = fmt(birth)
+    im = R.fp.get("modified")
+    if im and im - mtime > TOL:
+        R.add("fs", "medium", "文件内部声称的修改时间晚于电脑记录的最后写入时间", f"内部 {fmt(im)}；电脑 {fmt(mtime)}",
+              "电脑时钟错误；否则说明内部时间是写进去的，不是保存时自然产生的", "文件系统")
+    if im and birth and birth - im > dt.timedelta(hours=1) and not urls and not agent:
+        R.add("fs", "info", "文件在这台电脑上出现的时间晚于它声称的最后修改时间，且没有下载记录",
+              f"内部最后修改 {fmt(im)}；本机创建 {fmt(birth)}",
+              "从别处复制、解压、云盘同步、隔空投送都会这样；如果文件声称是在本机编辑的，这就讲不通", "文件系统")
+    if qtime and im and qtime - im > TOL and R.fp.get("geom"):
+        R.add("fs", "info", "文件下载到本机之后没有再保存过，但里面带着批注", f"下载于 {fmt(qtime)}；内部最后修改 {fmt(im)}",
+              "批注是下载之前就有的（别人加的或在别的设备上加的）", "隔离标记")
+
+
+# ---------------------------------------------------------------- 多文件比对
+def cross_compare(reports):
+    for A, B in itertools.combinations(reports, 2):
+        a, b = A.fp, B.fp
+        if not a or not b or (a.get("sha") and a.get("sha") == b.get("sha")):
+            continue
+        na, nb = os.path.basename(A.path), os.path.basename(B.path)
+        same_final = bool(a.get("id1")) and a.get("id1") == b.get("id1")
+        same_doc = bool(a.get("id0")) and a.get("id0") == b.get("id0")
+        same_geom = bool(a.get("geom")) and a.get("geom") == b.get("geom")
+        diff_times = a.get("times") != b.get("times")
+        if same_final:
+            for X, other in ((A, nb), (B, na)):
+                X.add("struct", "strong", f"与「{other}」的最终保存标识完全相同，但文件内容不同", f"ID = {a['id1'][:16]}…",
+                      "正常保存每次都会换一个新标识。标识相同而内容不同，说明其中一份是用工具从另一份改写出来的，没有经过正常保存", "PDF /ID")
+        elif same_doc and not same_geom:
+            for X, other in ((A, nb), (B, na)):
+                X.add("struct", "info", f"与「{other}」出自同一份原始 PDF", f"原始 ID = {a['id0'][:16]}…", "同一份题目或模板的不同副本，很常见", "PDF /ID")
+        if same_geom and diff_times:
+            n = len(a["geom"])
+            for X, other in ((A, nb), (B, na)):
+                X.add("review", "strong" if (same_final or same_doc) else "medium",
+                      f"与「{other}」的 {n} 条批注位置和内容完全相同，但时间不同", "两份文件的批注逐条重合，只有时间戳不一样",
+                      "同一批批注不可能产生于两个时间：至少有一份的批注时间不是原始记录。手动放置的批注在两次独立操作中落到完全相同的坐标，可能性极小", "批注")
+        if same_final or (same_geom and diff_times):
+            am, bm = a.get("modified"), b.get("modified")
+            if am and bm and am != bm:
+                X, Y, other = (A, B, nb) if am < bm else (B, A, na)
+                rewritten = any("文件头" in f["title"] or "日期的写法" in f["title"] for f in X.findings)
+                X.add("time", "strong" if rewritten else "medium", f"声称的最后修改时间早于同源文件「{other}」",
+                      f"本文件 {fmt(X.fp['modified'])}；对方 {fmt(Y.fp['modified'])}" + ("；且本文件带有被其他程序重写的特征" if rewritten else ""),
+                      "如果本文件是从对方改写而来，它的时间就不可能更早：说明时间被改写过。也可能反过来，需结合文件头和日期写法判断哪份是原件", "多文件比对")
 
 
 # ---------------------------------------------------------------- 调度与输出
@@ -1032,6 +1284,10 @@ def scan_file(path, opts):
             R.notes.append(f"不支持的文件类型 {ext}")
     except Exception as e:  # 单个文件出错不影响批量
         R.notes.append(f"扫描中途出错（{type(e).__name__}: {e}），以上结果不完整")
+    try:
+        scan_fs(path, R)
+    except Exception as e:
+        R.notes.append(f"文件外痕迹检查出错（{type(e).__name__}）")
     for k, v in list(R.facts.items()):
         if isinstance(v, set):
             R.facts[k] = "、".join(sorted(v))
@@ -1124,6 +1380,8 @@ def main(argv=None):
         print("没有找到可检查的文件", file=sys.stderr)
         return 2
     reports = [scan_file(f, opts) for f in files]
+    if len(reports) > 1:
+        cross_compare(reports)
     if a.format == "json":
         out = json.dumps({"tool": "ai_trace_scan", "version": VERSION, "scanned_at": fmt(now()),
                           "reports": [r.to_dict() for r in reports]}, ensure_ascii=False, indent=2)
