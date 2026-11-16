@@ -1,0 +1,12 @@
+{
+  "name": "ai-trace-detector",
+  "interface": { "displayName": "AI Trace Detector" },
+  "plugins": [
+    {
+      "name": "ai-trace-detector",
+      "source": { "source": "local", "path": "./plugins/ai-trace-detector" },
+      "policy": { "installation": "AVAILABLE", "authentication": "ON_INSTALL" },
+      "category": "Productivity"
+    }
+  ]
+}

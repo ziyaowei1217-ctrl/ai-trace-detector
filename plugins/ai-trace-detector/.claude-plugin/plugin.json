@@ -1,0 +1,9 @@
+{
+  "name": "ai-trace-detector",
+  "version": "0.1.0",
+  "description": "检查 Word、PowerPoint、Excel、PDF 文件里的 AI 生成痕迹：作者、路径、元数据、批注时间、文件结构、正文残留、AIGC/C2PA 标识、嵌入对象。可用于审核别人的文件，也可用于对外发送前自查。",
+  "author": { "name": "ziyaowei1217-ctrl" },
+  "repository": "https://github.com/ziyaowei1217-ctrl/ai-trace-detector",
+  "license": "MIT",
+  "keywords": ["ai-detection", "metadata", "forensics", "docx", "pdf"]
+}

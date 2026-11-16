@@ -1,0 +1,11 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "ai-trace-detector",
+  "version": "0.1.0",
+  "description": "Check Word, PowerPoint, Excel and PDF files for AI-generation traces: author, paths, metadata, comment timestamps, file structure, leftover chat text, AIGC/C2PA labels and embedded objects.",
+  "extensions": {
+    "com.openai": {
+      "interface": { "displayName": "AI Trace Detector", "category": "Productivity" }
+    }
+  }
+}

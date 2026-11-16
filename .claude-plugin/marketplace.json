@@ -1,0 +1,11 @@
+{
+  "name": "ai-trace-detector",
+  "owner": { "name": "ziyaowei1217-ctrl" },
+  "plugins": [
+    {
+      "name": "ai-trace-detector",
+      "source": "./plugins/ai-trace-detector",
+      "description": "检查 Word、PowerPoint、Excel、PDF 文件里的 AI 生成痕迹，支持审核和自查两种模式。"
+    }
+  ]
+}

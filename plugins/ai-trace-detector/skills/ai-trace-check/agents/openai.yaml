@@ -1,0 +1,3 @@
+interface:
+  display_name: "AI Trace Check"
+  short_description: "Scan Office and PDF files for AI-generation traces"

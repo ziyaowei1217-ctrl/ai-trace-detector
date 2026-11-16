@@ -1,0 +1,6 @@
+{
+  "name": "ai-trace-detector",
+  "version": "0.1.0",
+  "description": "Check Word, PowerPoint, Excel and PDF files for AI-generation traces.",
+  "skills": "./skills/"
+}
